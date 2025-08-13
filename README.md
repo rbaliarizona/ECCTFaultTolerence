@@ -1,34 +1,30 @@
-# Fault Tolerance Testing of Transformer-Based Error Correction Models
+# Error Correction Code Transformer
 
-## Overview  
-This project examines the fault tolerance of transformer-based error correction models, focusing on noise introduced during and due to syndrome processing. It builds on the transformer architecture proposed in [*Accelerating Error Correction Code Transformers*](https://arxiv.org/pdf/2410.05911v1).
+Implementation of the Error Correction Code Transformer described in ["Error Correction Code Transformer (NeurIPS 2022)"](https://arxiv.org/abs/2203.14966).
 
-This is part of the final project for  **ECE 537: Coding and Information Theory**, Fall 2024, taught by Dr. Bane Vasic and Dr. Asit Kumar Pradhan [Course Link](https://ece.engineering.arizona.edu/course/ece/537).  
+<p align="center">
+<img src="Codes_DB/z_ecct_image.png" width="550px">
+</p>
 
-## Key Resources  
-- **Overleaf Document**: Contains the project writeup and current analysis. [Access here](https://www.overleaf.com/project/6744fbbdfa274c289f00070c).  
+## Abstract
 
-## Setup
+Error correction code is a major part of the communication physical layer, ensuring the reliable transfer of data over noisy channels. Recently, neural decoders were shown to outperform classical decoding techniques. However, the existing neural approaches present strong overfitting due to the exponential training complexity, or a restrictive inductive bias due to reliance on Belief Propagation. Recently, Transformers have become methods of choice in many applications thanks to their ability to represent complex interactions between elements. In this work, we propose to extend for the first time the Transformer architecture to the soft decoding of linear codes at arbitrary block lengths. We encode each channel's output dimension to high dimension for better representation of the bits information to be processed separately. The element-wise processing allows the analysis of the channel output reliability, while the algebraic code and the interaction between the bits are inserted into the model via an adapted masked self-attention module. The proposed approach demonstrates the extreme power and flexibility of Transformers and outperforms existing state-of-the-art neural decoders by large margins at a fraction of their time complexity.
 
-1. **Clone the repository**:  
-    ```bash
-    git clone https://github.com/yourusername/project-repo.git
-    cd project-repo
-    ```
+## Install
+- Pytorch
 
-2. **Install dependencies**:  
-    If you haven’t already, install the required libraries:  
-    ```bash
-    pip install -r requirements.txt
-    ```
+## Script
+Use the following command to train, on GPU 0, a 6 layers ECCT of dimension 32 on the POLAR(64,32) code:
 
-### Training a decoder  
+`python Main.py --gpus=0 --N_dec=6 --d_model=32 --code_type=POLAR --code_n=64 --code_k=32`
 
-Use the following command to train a 6 layers AECCT of dimension 128 on the LDPC(49,24) code:
-
-```bash
-python main.py --code LDPC_N49_K24 --N_dec 6 --d_model 128
-```
-
-
-
+## Reference
+    @article{choukroun2022error,
+      title={Error Correction Code Transformer},
+      author={Choukroun, Yoni and Wolf, Lior},
+      journal={arXiv preprint arXiv:2203.14966},
+      year={2022}
+    }
+    
+## License
+This repo is MIT licensed.
