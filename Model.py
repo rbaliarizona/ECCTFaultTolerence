@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import math
 import copy
 import logging
-from Codes import sign_to_bin
+from Codes import sign_to_bin, bin_to_sign
 
 
 def clones(module, N):
@@ -166,8 +166,220 @@ class ECC_Transformer(nn.Module):
         self.register_buffer('src_mask', src_mask)
 
 
+
+class NoisySyndromeECCTDecoder(nn.Module):
+    def __init__(self, ecct_model, P, syndrome_sigma=0.5, readout_sigma=0.1, max_steps=5, stop_hidden=64, stop_threshold=0.5):
+        super().__init__()
+        self.ecct = ecct_model
+        self.P = P.float()  # [m, n]
+        self.syndrome_sigma = syndrome_sigma  # AWGN on syndrome
+        self.readout_sigma = readout_sigma    # AWGN on y after syndrome
+        self.max_steps = max_steps
+        self.stop_threshold = stop_threshold
+
+        n = P.shape[1]
+        m = P.shape[0]
+
+        self.controller = nn.Sequential(
+            nn.Linear(n + m, stop_hidden),
+            nn.ReLU(),
+            nn.Linear(stop_hidden, 1)
+        )
+
+    def noisy_syndrome(self, y):
+        y_b = (y < 0).float()
+        s = (self.P @ y_b.T).T % 2
+        s = 1 - 2 * s
+        return s + torch.randn_like(s) * self.syndrome_sigma
+
+    def degrade_y(self, y):
+        return y + torch.randn_like(y) * self.readout_sigma
+
+    def forward(self, y_init, x_clean):
+        """
+        Iteratively decode using ECCT and learned stopping criterion.
+        Returns final y and z_pred from the step where stopping occurred.
+        """
+        y = y_init.clone()
+        batch_size = y.shape[0]
+        stopped = torch.zeros(batch_size, dtype=torch.bool, device=y.device)
+
+        final_z = torch.zeros_like(y)
+        final_y = y.clone()
+
+        for t in range(self.max_steps):
+            s = self.noisy_syndrome(y)
+            y = self.degrade_y(y)
+
+            mag = torch.abs(y)
+            inp = torch.cat([mag, s], dim=1)
+
+            z_pred = self.ecct(mag, s)
+            stop_logit = self.controller(inp)
+            stop_prob = torch.sigmoid(stop_logit).squeeze(1)
+
+            should_stop = (stop_prob > self.stop_threshold) & (~stopped)
+
+            final_z[should_stop] = z_pred[should_stop]
+            final_y[should_stop] = y[should_stop]
+            stopped = stopped | should_stop
+
+            if stopped.all():
+                break
+
+        # Fallback: if nothing stopped
+        if not stopped.all():
+            final_z[~stopped] = z_pred[~stopped]
+            final_y[~stopped] = y[~stopped]
+
+        return final_y, final_z
+
+    def loss(self, z_pred, y_final, x_clean):
+        """
+        Supervise z_pred so that sign(z_pred * y_final) ≈ x_clean
+        """
+        z_mul = (y_final * bin_to_sign(x_clean))
+        loss = F.binary_cross_entropy_with_logits(z_pred, sign_to_bin(torch.sign(z_mul)))
+        x_pred = sign_to_bin(torch.sign(-z_pred * torch.sign(y_final)))
+        return loss, x_pred
+
+
 ############################################################
 ############################################################
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+# relies on your existing imports from Codes:
+# from Codes import sign_to_bin, bin_to_sign
+
+class NoisySyndromeRNNECCTDecoder(nn.Module):
+    """
+    RNN wrapper around ECCT with learned halting via a straight-through gate.
+    - At each step t:
+        s_t = noisy_syndrome(y_t)              # AWGN on syndrome (syndrome_sigma)
+        y_{t+1} = y_t + N(0, readout_sigma^2)  # readout noise after measurement
+        z_t = ECCT(|y_{t+1}|, s_t)             # logits for per-bit flip
+        h_{t+1} = GRU([|y_{t+1}|, s_t], h_t)   # controller state
+        p_stop_t = sigmoid(W h_{t+1})
+        gate_t = ST_Bernoulli(p_stop_t, threshold)  # hard forward, soft gradient
+        if first gate_t=1 for a sample: take (y_{t+1}, z_t) as final outputs
+    - forward() returns (y_final, z_pred_final). No loss is computed here.
+    - loss() identical to your current formulation (moving target).
+    """
+    def __init__(self,
+                 ecct_model,
+                 P,
+                 syndrome_sigma=0.5,
+                 readout_sigma=0.1,
+                 max_steps=5,
+                 stop_hidden=64,
+                 stop_threshold=0.5):
+        super().__init__()
+        self.ecct = ecct_model
+        self.P = P.float()              # [m, n]
+        self.syndrome_sigma = syndrome_sigma
+        self.readout_sigma = readout_sigma
+        self.max_steps = max_steps
+        self.stop_threshold = stop_threshold
+
+        n = P.shape[1]
+        m = P.shape[0]
+        self.rnn_cell = nn.GRUCell(input_size=n + m, hidden_size=stop_hidden)
+        self.stop_head = nn.Linear(stop_hidden, 1)
+
+    # ----- channel / measurement models -----
+    def noisy_syndrome(self, y):
+        # Binary map from current y, then H*yb (mod 2) → {±1} → add AWGN
+        y_b = (y < 0).float()
+        s = (self.P @ y_b.T).T % 2.0
+        s = 1.0 - 2.0 * s
+        return s + torch.randn_like(s) * self.syndrome_sigma
+
+    def degrade_y(self, y):
+        return y + torch.randn_like(y) * self.readout_sigma
+
+    # ----- straight-through halting gate -----
+    @staticmethod
+    def _st_hard_sigmoid_gate(prob, threshold, force_stop_mask=None):
+        """
+        prob: [B] in (0,1), threshold: scalar
+        force_stop_mask: optional bool [B], forces gate=1 for those entries (hard),
+                         but keeps soft gradient via straight-through trick.
+        Returns: gate (hard forward, soft gradient), hard_mask (bool) used this step.
+        """
+        hard = (prob > threshold).float()
+        if force_stop_mask is not None:
+            hard = torch.where(force_stop_mask, torch.ones_like(hard), hard)
+        # straight-through: hard + soft - soft.detach()
+        gate = hard + prob - prob.detach()
+        return gate, hard.bool()
+
+    # ----- main unroll -----
+    def forward(self, y_init, x_clean):
+        """
+        Returns:
+            y_final: [B, n] degraded y at the chosen step
+            z_pred: [B, n] ECCT logits at the chosen step
+        """
+        device = y_init.device
+        B, n = y_init.shape
+        y = y_init.clone()
+
+        # controller state
+        h = torch.zeros(B, self.rnn_cell.hidden_size, device=device)
+
+        # track which samples have already stopped
+        stopped = torch.zeros(B, dtype=torch.bool, device=device)
+
+        # running “chosen” outputs (initialized to zeros, then filled once)
+        y_final = torch.zeros_like(y)
+        z_final = torch.zeros_like(y)
+        for t in range(self.max_steps):
+            # 1) measure syndrome on current y, then degrade y
+            s = self.noisy_syndrome(y)
+            y = self.degrade_y(y)  # model readout corruption right after measurement
+
+            # 2) ECCT decode on (|y|, s) to get z logits
+            mag = torch.abs(y)
+            z_t = self.ecct(mag, s)  # logits, shape [B, n]; ECCT expects (magnitude, syndrome). :contentReference[oaicite:3]{index=3}
+
+            # 3) controller update & halting probability
+            ctrl_in = torch.cat([mag, s], dim=1)
+            h = self.rnn_cell(ctrl_in, h)                 # GRUCell
+            p_stop = torch.sigmoid(self.stop_head(h)).squeeze(1)  # [B]
+
+            # 4) build ST halting gate; force stop on last step for any still-running sample
+            force_last = (~stopped) & (t == self.max_steps - 1)
+            gate, hard_now = self._st_hard_sigmoid_gate(p_stop, self.stop_threshold, force_last)
+
+            # only first stop per sample should be taken
+            take_mask = ((~stopped).float() * gate).unsqueeze(1)  # [B,1], hard in fwd, soft in grad
+            y_final = take_mask * y + (1.0 - take_mask) * y_final
+            z_final = take_mask * z_t + (1.0 - take_mask) * z_final
+            stopped = stopped | hard_now
+
+            if stopped.all():
+                break
+
+        return y_final, z_final
+
+    # ----- same loss you use now (moving target supervision for z) -----
+    def loss(self, z_pred, y_final, x_clean):
+        """
+        BCE-with-logits against target z* = sign(y_final) * sign(x_clean)
+        (implemented via bin targets as in your current code).
+        Also returns x_pred for BER/FER.
+        """
+        z_mul = (y_final * bin_to_sign(x_clean))
+        loss = F.binary_cross_entropy_with_logits(z_pred, sign_to_bin(torch.sign(z_mul)))
+        x_pred = sign_to_bin(torch.sign(-z_pred * torch.sign(y_final)))
+        return loss, x_pred
+
+
 
 if __name__ == '__main__':
     pass

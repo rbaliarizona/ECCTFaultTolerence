@@ -80,6 +80,7 @@ def BER(x_pred, x_gt):
     return torch.mean((x_pred != x_gt).float()).item()
 
 def FER(x_pred, x_gt):
+    """ Frame error rate """
     return torch.mean(torch.any(x_pred != x_gt, dim=1).float()).item()
 
 #############################################
