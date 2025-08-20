@@ -14,7 +14,7 @@ import logging
 from Codes import *
 import time
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from Model import ECC_Transformer, NoisySyndromeECCTDecoder, NoisySyndromeRNNECCTDecoder
+from Model import ECC_Transformer
 import tempfile
 import pdb
 import json
@@ -35,13 +35,16 @@ def set_seed(seed=42):
 
 class ECC_Dataset(data.Dataset):
     def __init__(
-        self, code, sigma, len, zero_cw=True
+        self, code, sigma, len, syndrome_sigma, readout_sigma, zero_cw=True
     ):
         self.code = code
         self.sigma = sigma
+        self.syndrome_sigma = syndrome_sigma
+        self.readout_sigma = readout_sigma
         self.len = len
         self.generator_matrix = code.generator_matrix.transpose(0, 1)
         self.pc_matrix = code.pc_matrix.transpose(0, 1)
+
         self.zero_word = torch.zeros((self.code.k)).long() if zero_cw else None
         self.zero_cw = torch.zeros((self.code.n)).long() if zero_cw else None
 
@@ -57,11 +60,25 @@ class ECC_Dataset(data.Dataset):
             x = self.zero_cw
         z = torch.randn(self.code.n) * random.choice(self.sigma)
         y = bin_to_sign(x) + z
+        syndrome = (
+            torch.matmul(sign_to_bin(torch.sign(y)).long(), self.pc_matrix) % 2
+        )
+        syndrome = bin_to_sign(syndrome)
+        syndrome_noise = (
+            torch.randn(len(syndrome)) * self.syndrome_sigma
+        )  # add noise to syndrome
+        syndrome = syndrome.float() + syndrome_noise
+        # post_measurement readout noise
+        y_noise = torch.randn(len(y)) * self.readout_sigma
+        y += y_noise
+        magnitude = torch.abs(y)
         return (
             m.float(),
             x.float(),
             z.float(),
             y.float(),
+            magnitude.float(),
+            syndrome.float(),
         )
 
 
@@ -73,11 +90,12 @@ def train(model, device, train_loader, optimizer, epoch, LR):
     model.train()
     cum_loss = cum_ber = cum_fer = cum_samples = 0
     t = time.time()
-    for batch_idx, (m, x, z, y) in enumerate(
+    for batch_idx, (m, x, z, y, magnitude, syndrome) in enumerate(
         train_loader
     ):
-        y_final, z_pred = model(y.to(device), x.to(device))
-        loss, x_pred = model.loss(-z_pred, y_final.to(device), x.to(device))
+        z_mul = y * bin_to_sign(x)
+        z_pred = model(magnitude.to(device), syndrome.to(device))
+        loss, x_pred = model.loss(-z_pred, z_mul.to(device), y.to(device))
         model.zero_grad()
         loss.backward()
         optimizer.step()
@@ -113,9 +131,12 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
         for ii, test_loader in enumerate(test_loader_list):
             test_loss = test_ber = test_fer = cum_count = 0.0
             while True:
-                (m, x, z, y) = next(iter(test_loader))
-                y_final, z_pred = model(y.to(device), x.to(device))
-                loss, x_pred = model.loss(-z_pred, y_final.to(device), x.to(device))
+                (m, x, z, y, magnitude, syndrome) = next(iter(test_loader))
+                z_mul = y * bin_to_sign(x)
+                z_pred = model(magnitude.to(device), syndrome.to(device))
+                loss, x_pred = model.loss(
+                    -z_pred, z_mul.to(device), y.to(device)
+                )
 
                 test_loss += loss.item() * x.shape[0]
                 test_ber += BER(x_pred, x.to(device)) * x.shape[0]
@@ -198,18 +219,9 @@ def main(args):
     code = args.code
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(log_dir=os.path.join(args.path, 'runs'))
+
     #################################
-    syndrome_sigma = EbN0_to_std(args.ebno_syndrome_dB, code.k / code.n)
-    readout_sigma = EbN0_to_std(args.ebno_readout_dB, code.k / code.n)
-
-    ecct_model = ECC_Transformer(args, dropout=0).to(device)
-    model = NoisySyndromeRNNECCTDecoder(
-        ecct_model,
-        code.pc_matrix.to(device),
-        syndrome_sigma=syndrome_sigma,
-        readout_sigma=readout_sigma,
-    ).to(device)
-
+    model = ECC_Transformer(args, dropout=0).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
@@ -222,11 +234,15 @@ def main(args):
     EbNo_range_train = range(2, 8)
     std_train = [EbN0_to_std(ii, code.k / code.n) for ii in EbNo_range_train]
     std_test = [EbN0_to_std(ii, code.k / code.n) for ii in EbNo_range_test]
+    syndrome_sigma = EbN0_to_std(args.ebno_syndrome_dB, code.k / code.n)
+    readout_sigma = EbN0_to_std(args.ebno_readout_dB, code.k / code.n)
     train_dataloader = DataLoader(
         ECC_Dataset(
             code,
             std_train,
             len=args.batch_size * 1000,
+            syndrome_sigma=syndrome_sigma,
+            readout_sigma=readout_sigma,
             zero_cw=True,
         ),
         batch_size=int(args.batch_size),
@@ -239,6 +255,8 @@ def main(args):
                 code,
                 [std_test[ii]],
                 len=int(args.test_batch_size),
+                syndrome_sigma=syndrome_sigma,
+                readout_sigma=readout_sigma,
                 zero_cw=False,
             ),
             batch_size=int(args.test_batch_size),
@@ -261,20 +279,23 @@ def main(args):
         )
         scheduler.step()
 
+        # Log training loss, BER, FER
         writer.add_scalar("Loss/train", loss, epoch)
         writer.add_scalar("BER/train", ber, epoch)
         writer.add_scalar("FER/train", fer, epoch)
 
+
         if loss < best_loss:
             best_loss = loss
             torch.save(model, os.path.join(args.path, "best_model"))
-        if epoch % 10 == 0 or epoch in [1, args.epochs]:
+        if epoch % 25 == 0 or epoch in [1, args.epochs]:
             test_loss_list, test_ber_list, test_fer_list = test(model, device, test_dataloader_list, EbNo_range_test)
             for ebno, loss, ber, fer in zip(EbNo_range_test, test_loss_list, test_ber_list, test_fer_list):
                 writer.add_scalar(f"Loss/test_EbN0_{ebno}", loss, epoch)
                 writer.add_scalar(f"BER/test_EbN0_{ebno}", ber, epoch)
                 writer.add_scalar(f"FER/test_EbN0_{ebno}", fer, epoch)
     writer.close()
+
 
 ##################################################################################################################
 ##################################################################################################################
@@ -355,7 +376,7 @@ if __name__ == "__main__":
         print(f"Temporary directory created at: {temp_dir}")
     else:
         model_dir = os.path.join(
-            "Results_QECCT",
+            "Results_ECCT",
             args.code_type
             + "__Code_n_"
             + str(args.code_n)
