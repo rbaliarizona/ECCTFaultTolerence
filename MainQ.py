@@ -14,7 +14,11 @@ import logging
 from Codes import *
 import time
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from Model import ECC_Transformer, NoisySyndromeECCTDecoder, NoisySyndromeRNNECCTDecoder
+from Model import (
+    ECC_Transformer,
+    NoisySyndromeECCTDecoder,
+    NoisySyndromeRNNECCTDecoder,
+)
 import tempfile
 import pdb
 import json
@@ -34,9 +38,7 @@ def set_seed(seed=42):
 
 
 class ECC_Dataset(data.Dataset):
-    def __init__(
-        self, code, sigma, len, zero_cw=True
-    ):
+    def __init__(self, code, sigma, len, zero_cw=True):
         self.code = code
         self.sigma = sigma
         self.len = len
@@ -72,28 +74,52 @@ class ECC_Dataset(data.Dataset):
 def train(model, device, train_loader, optimizer, epoch, LR):
     model.train()
     cum_loss = cum_ber = cum_fer = cum_samples = 0
+    stop_sum = 0.0
+    stop_hist = torch.zeros(getattr(model, "max_steps", 1), dtype=torch.long)
     t = time.time()
-    for batch_idx, (m, x, z, y) in enumerate(
-        train_loader
-    ):
-        y_final, z_pred = model(y.to(device), x.to(device))
-        loss, x_pred = model.loss(-z_pred, y_final.to(device), x.to(device))
+
+    for batch_idx, (m, x, z, y) in enumerate(train_loader):
+        y = y.to(device)
+        x = x.to(device)
+
+        y_final, z_pred, stop_step = model(y, x)  # stop_step: [B], 0-based
+        loss, x_pred = model.loss(-z_pred, y_final, x)
+
         model.zero_grad()
         loss.backward()
         optimizer.step()
-        ###
-        ber = BER(x_pred, x.to(device))
-        fer = FER(x_pred, x.to(device))
 
-        cum_loss += loss.item() * x.shape[0]
-        cum_ber += ber * x.shape[0]
-        cum_fer += fer * x.shape[0]
-        cum_samples += x.shape[0]
+        # metrics
+        bsz = x.shape[0]
+        ber = BER(x_pred, x)
+        fer = FER(x_pred, x)
+
+        cum_loss += loss.item() * bsz
+        cum_ber += ber * bsz
+        cum_fer += fer * bsz
+        cum_samples += bsz
+
+        ss = stop_step.cpu()
+        stop_sum += ss.float().sum().item()
+        # grow hist if needed (defensive)
+        if ss.max().item() >= stop_hist.numel():
+            new_len = int(max(ss.max().item() + 1, stop_hist.numel()))
+            new_hist = torch.zeros(new_len, dtype=torch.long)
+            new_hist[: stop_hist.numel()] = stop_hist
+            stop_hist = new_hist
+        counts = torch.bincount(ss, minlength=stop_hist.numel())
+        stop_hist[: counts.numel()] += counts
+
         if (batch_idx + 1) % 500 == 0 or batch_idx == len(train_loader) - 1:
+            avg_stop = stop_sum / max(1, cum_samples)  # 0-based
             logging.info(
-                f"Training epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}: LR={LR:.2e}, Loss={cum_loss / cum_samples:.2e} BER={cum_ber / cum_samples:.2e} FER={cum_fer / cum_samples:.2e}"
+                f"Training epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}: "
+                f"LR={LR:.2e}, Loss={cum_loss / cum_samples:.2e} "
+                f"BER={cum_ber / cum_samples:.2e} FER={cum_fer / cum_samples:.2e} "
+                f"AvgStop(0b)={avg_stop:.2f} Hist={stop_hist.tolist()}"
             )
-    logging.info(f"Epoch {epoch} Train Time {time.time() - t}s\n")
+
+    logging.info(f"Epoch {epoch} Train Time {time.time() - t:.2f}s\n")
     return cum_loss / cum_samples, cum_ber / cum_samples, cum_fer / cum_samples
 
 
@@ -108,45 +134,76 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
         [],
         [],
     )
+    test_avg_stop_list, test_stop_hist_list = [], []
     t = time.time()
+
     with torch.no_grad():
         for ii, test_loader in enumerate(test_loader_list):
             test_loss = test_ber = test_fer = cum_count = 0.0
+            stop_sum = 0.0
+            stop_hist = None
+
             while True:
                 (m, x, z, y) = next(iter(test_loader))
-                y_final, z_pred = model(y.to(device), x.to(device))
-                loss, x_pred = model.loss(-z_pred, y_final.to(device), x.to(device))
+                y = y.to(device)
+                x = x.to(device)
 
-                test_loss += loss.item() * x.shape[0]
-                test_ber += BER(x_pred, x.to(device)) * x.shape[0]
-                test_fer += FER(x_pred, x.to(device)) * x.shape[0]
-                cum_count += x.shape[0]
+                y_final, z_pred, stop_step = model(
+                    y, x
+                )  # stop_step: [B], 0-based
+                loss, x_pred = model.loss(-z_pred, y_final, x)
+
+                bsz = x.shape[0]
+                test_loss += loss.item() * bsz
+                test_ber += BER(x_pred, x) * bsz
+                test_fer += FER(x_pred, x) * bsz
+                cum_count += bsz
+
+                # ---- stopping stats
+                ss = stop_step.detach().cpu()
+                stop_sum += (
+                    ss.float().sum().item()
+                )  # still fine: mean of 0-based indices
+                if stop_hist is None:
+                    L = int(ss.max().item())
+                    stop_hist = torch.zeros(
+                        max(L, getattr(model, "max_steps", L)) + 1,
+                        dtype=torch.long,
+                    )
+                counts = torch.bincount(ss, minlength=stop_hist.numel())
+                stop_hist[: counts.numel()] += counts
+
                 if (
                     min_FER > 0 and test_fer > min_FER and cum_count > 1e5
                 ) or cum_count >= 1e9:
-                    if cum_count >= 1e9:
-                        print(
-                            f"Number of samples threshold reached for EbN0:{EbNo_range_test[ii]}"
-                        )
-                    else:
-                        print(
-                            f"FER count threshold reached for EbN0:{EbNo_range_test[ii]}"
-                        )
                     break
+
             cum_samples_all.append(cum_count)
             test_loss_list.append(test_loss / cum_count)
             test_loss_ber_list.append(test_ber / cum_count)
             test_loss_fer_list.append(test_fer / cum_count)
+
+            avg_stop = stop_sum / cum_count  # this is 0-based average
+            test_avg_stop_list.append(avg_stop)
+
+            # histogram: bins correspond to steps [0..max_steps-1]
+            hist_readable = stop_hist[
+                : getattr(model, "max_steps", stop_hist.numel())
+            ].tolist()
+            test_stop_hist_list.append(hist_readable)
+
             print(
-                f"Test EbN0={EbNo_range_test[ii]}, BER={test_loss_ber_list[-1]:.2e}"
+                f"Test EbN0={EbNo_range_test[ii]}, BER={test_loss_ber_list[-1]:.2e}, "
+                f"AvgStop={avg_stop:.2f}, Hist={hist_readable}"
             )
-        ###
+
+        # ----- logging summaries
         logging.info(
-            "\nTest Loss "
+            "Test Loss "
             + " ".join(
                 [
-                    "{}: {:.2e}".format(ebno, elem)
-                    for (elem, ebno) in (zip(test_loss_list, EbNo_range_test))
+                    f"{ebno}: {elem:.2e}"
+                    for elem, ebno in zip(test_loss_list, EbNo_range_test)
                 ]
             )
         )
@@ -154,10 +211,8 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
             "Test FER "
             + " ".join(
                 [
-                    "{}: {:.2e}".format(ebno, elem)
-                    for (elem, ebno) in (
-                        zip(test_loss_fer_list, EbNo_range_test)
-                    )
+                    f"{ebno}: {elem:.2e}"
+                    for elem, ebno in zip(test_loss_fer_list, EbNo_range_test)
                 ]
             )
         )
@@ -165,10 +220,8 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
             "Test BER "
             + " ".join(
                 [
-                    "{}: {:.2e}".format(ebno, elem)
-                    for (elem, ebno) in (
-                        zip(test_loss_ber_list, EbNo_range_test)
-                    )
+                    f"{ebno}: {elem:.2e}"
+                    for elem, ebno in zip(test_loss_ber_list, EbNo_range_test)
                 ]
             )
         )
@@ -176,17 +229,38 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
             "Test -ln(BER) "
             + " ".join(
                 [
-                    "{}: {:.2e}".format(ebno, -np.log(elem))
-                    for (elem, ebno) in (
-                        zip(test_loss_ber_list, EbNo_range_test)
-                    )
+                    f"{ebno}: {(-np.log(elem)):.2e}"
+                    for elem, ebno in zip(test_loss_ber_list, EbNo_range_test)
                 ]
             )
         )
+        logging.info(
+            "Test AvgStop "
+            + " ".join(
+                [
+                    f"{ebno}: {avg:.2f}"
+                    for avg, ebno in zip(test_avg_stop_list, EbNo_range_test)
+                ]
+            )
+        )
+        logging.info(
+            "Test StopHist "
+            + " ".join(
+                [
+                    f"{ebno}: {hist}"
+                    for hist, ebno in zip(test_stop_hist_list, EbNo_range_test)
+                ]
+            )
+        )
+
     logging.info(
         f"# of testing samples: {cum_samples_all}\n Test Time {time.time() - t} s\n"
     )
-    return test_loss_list, test_loss_ber_list, test_loss_fer_list
+    return (
+        test_loss_list,
+        test_loss_ber_list,
+        test_loss_fer_list,
+    )
 
 
 ##################################################################
@@ -197,7 +271,7 @@ def test(model, device, test_loader_list, EbNo_range_test, min_FER=100):
 def main(args):
     code = args.code
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(log_dir=os.path.join(args.path, 'runs'))
+    writer = SummaryWriter(log_dir=os.path.join(args.path, "runs"))
     #################################
     syndrome_sigma = EbN0_to_std(args.ebno_syndrome_dB, code.k / code.n)
     readout_sigma = EbN0_to_std(args.ebno_readout_dB, code.k / code.n)
@@ -269,12 +343,17 @@ def main(args):
             best_loss = loss
             torch.save(model, os.path.join(args.path, "best_model"))
         if epoch % 10 == 0 or epoch in [1, args.epochs]:
-            test_loss_list, test_ber_list, test_fer_list = test(model, device, test_dataloader_list, EbNo_range_test)
-            for ebno, loss, ber, fer in zip(EbNo_range_test, test_loss_list, test_ber_list, test_fer_list):
+            test_loss_list, test_ber_list, test_fer_list = test(
+                model, device, test_dataloader_list, EbNo_range_test
+            )
+            for ebno, loss, ber, fer in zip(
+                EbNo_range_test, test_loss_list, test_ber_list, test_fer_list
+            ):
                 writer.add_scalar(f"Loss/test_EbN0_{ebno}", loss, epoch)
                 writer.add_scalar(f"BER/test_EbN0_{ebno}", ber, epoch)
                 writer.add_scalar(f"FER/test_EbN0_{ebno}", fer, epoch)
     writer.close()
+
 
 ##################################################################################################################
 ##################################################################################################################

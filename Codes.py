@@ -76,6 +76,11 @@ def EbN0_to_std(EbN0, rate):
     snr =  EbN0 + 10. * np.log10(2 * rate)
     return np.sqrt(1. / (10. ** (snr / 10.)))
 
+def std_to_EbN0(std, rate):
+    snr = 10 * np.log10(1.0 / (std ** 2))
+    EbN0 = snr - 10. * np.log10(2 * rate)
+    return round(EbN0, 1)
+
 def BER(x_pred, x_gt):
     return torch.mean((x_pred != x_gt).float()).item()
 

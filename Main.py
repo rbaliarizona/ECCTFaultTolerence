@@ -171,7 +171,7 @@ def main(args):
         if loss < best_loss:
             best_loss = loss
             torch.save(model, os.path.join(args.path, 'best_model'))
-        if epoch % 300 == 0 or epoch in [1, args.epochs]:
+        if epoch % 250 == 0 or epoch in [1, args.epochs]:
             test(model, device, test_dataloader_list, EbNo_range_test)
 
 ##################################################################################################################
@@ -180,6 +180,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch ECCT')
+    parser.add_argument('--tmp', action='store_true')
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -217,7 +218,11 @@ if __name__ == '__main__':
     code.pc_matrix = torch.from_numpy(H).long()
     args.code = code
     ####################################################################
-    model_dir = os.path.join('Results_ECCT',
+    if args.tmp:
+        outdir_name = 'Results_ECCT/tmp'
+    else:
+        outdir_name = '/home/rbali/Results_ECCT'
+    model_dir = os.path.join(outdir_name,
                              args.code_type + '__Code_n_' + str(
                                  args.code_n) + '_k_' + str(
                                  args.code_k) + '__' + datetime.now().strftime(
